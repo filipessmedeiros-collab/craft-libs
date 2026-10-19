@@ -304,6 +304,7 @@ fn frame(ctx: &Context, layout: &Layout<u32>, events: Vec<Event>, focused: bool)
     (output, ids)
 }
 
+/// Render one input frame and expose the cursor output alongside docking actions.
 fn frame_with_cursor(ctx: &Context, layout: &Layout<u32>, events: Vec<Event>, focused: bool) -> (DockOutput<u32>, Vec<Id>, egui::CursorIcon) {
     let mut output = DockOutput::default();
     let mut ids = Vec::new();
@@ -618,6 +619,7 @@ fn floating_only_surface_does_not_allocate_the_callers_document_region() {
     .clear();
 }
 
+/// Moving the group preserves membership; dragging a tab detaches only that tab.
 #[test]
 fn floating_group_grip_moves_every_member_while_tab_drag_detaches_one() {
     let ctx = Context::default();
@@ -626,7 +628,7 @@ fn floating_group_grip_moves_every_member_while_tab_drag_detaches_one() {
     for _ in 0..2 {
         step(&ctx, &mut layout, vec![]);
     }
-    let start = pos2(86.0, 82.0);
+    let start = ctx.read_response(Id::new("test-area").with(("move-group", Some(&5u32)))).unwrap().rect.center();
     step(&ctx, &mut layout, vec![Event::PointerMoved(start), pointer_button(start, true)]);
     let actions = step(&ctx, &mut layout, vec![Event::PointerMoved(start + vec2(50.0, 40.0))]);
     assert!(actions.iter().any(|a| matches!(a, Action::MoveFloating { .. })));
@@ -654,6 +656,7 @@ struct CustomContent {
     bodies: usize,
 }
 
+/// Workspace replacement cancels the old group gesture before further pointer motion.
 #[test]
 fn host_cancel_discards_group_drag_before_workspace_replacement() {
     let ctx = Context::default();
@@ -661,7 +664,7 @@ fn host_cancel_discards_group_drag_before_workspace_replacement() {
     for _ in 0..2 {
         step(&ctx, &mut layout, vec![]);
     }
-    let start = pos2(86.0, 82.0);
+    let start = ctx.read_response(Id::new("test-area").with(("move-group", Some(&5u32)))).unwrap().rect.center();
     step(&ctx, &mut layout, vec![Event::PointerMoved(start), pointer_button(start, true)]);
     let moved = start + vec2(50.0, 40.0);
     let actions = step(&ctx, &mut layout, vec![Event::PointerMoved(moved)]);
@@ -775,6 +778,7 @@ fn overlay_appearing_mid_drag_blocks_release_and_float_fallback() {
     assert!(out.actions.is_empty());
 }
 
+/// Escape restores the outer frame after moving a floating group.
 #[test]
 fn group_move_escape_restores_original_geometry() {
     let ctx = Context::default();
@@ -783,7 +787,7 @@ fn group_move_escape_restores_original_geometry() {
     for _ in 0..2 {
         step(&ctx, &mut layout, vec![]);
     }
-    let start = pos2(86.0, 82.0);
+    let start = ctx.read_response(Id::new("test-area").with(("move-group", Some(&5u32)))).unwrap().rect.center();
     step(&ctx, &mut layout, vec![Event::PointerMoved(start), pointer_button(start, true)]);
     step(&ctx, &mut layout, vec![Event::PointerMoved(start + vec2(50.0, 40.0))]);
     assert_ne!(layout.floating[0].rect, original);
@@ -823,11 +827,15 @@ fn custom_headers_and_labels_render_at_small_and_large_scales() {
     }
 }
 
+/// A protected member prevents moving the entire floating group.
 #[test]
 fn protected_group_member_blocks_whole_group_gesture_and_host_drop() {
     let ctx = Context::default();
     let layout = sample();
-    let start = pos2(86.0, 82.0);
+    for _ in 0..2 {
+        frame(&ctx, &layout, vec![], true);
+    }
+    let start = ctx.read_response(Id::new("test-area").with(("move-group", Some(&5u32)))).unwrap().rect.center();
     for events in [
         vec![],
         vec![],
@@ -1095,6 +1103,7 @@ fn popup_action_labels_use_custom_visual_text_and_logical_accessibility() {
     }
 }
 
+/// All eight handles retain the opposite edge and emit matching hover and drag cursors.
 #[test]
 fn floating_windows_resize_from_every_edge_and_corner_without_moving_the_opposite_edge() {
     use egui::CursorIcon::{ResizeHorizontal, ResizeNeSw, ResizeNwSe, ResizeVertical};
@@ -1152,4 +1161,60 @@ fn floating_windows_resize_from_every_edge_and_corner_without_moving_the_opposit
         assert_eq!(layout.floating[0].rect, expected, "({hx}, {hy})");
         assert_eq!(layout.panels().len(), 6, "resizing must keep group membership");
     }
+}
+
+/// Scrollbar drags near the right border must scroll the body, not resize the window.
+#[test]
+fn floating_body_scrollbar_keeps_its_drag_region() {
+    let ctx = Context::default();
+    let mut layout = sample();
+    let original = layout.floating[0].rect;
+    let mut body = Rect::NOTHING;
+    let mut offset = 0.0;
+    let mut render = |events: Vec<Event>| {
+        let mut output = DockOutput::default();
+        ctx.run_ui(RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))), events, ..Default::default() }, |ui| {
+            let style = DockStyle::from_ui(ui);
+            output = DockArea::new(Id::new("test-area")).show(
+                ui,
+                &layout,
+                &style,
+                |p| format!("Panel {p}"),
+                |_| Permissions::default(),
+                |ui, panel| {
+                    ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
+                    let rect = ui.max_rect();
+                    let scroll = egui::ScrollArea::vertical()
+                        .id_salt(panel)
+                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                        .show(ui, |ui| {
+                            for _ in 0..100 {
+                                ui.label("Scrollable panel content");
+                            }
+                        });
+                    if *panel == 6 {
+                        body = ui.ctx().read_response(scroll.id.with(1_usize)).unwrap().rect.intersect(rect);
+                        offset = scroll.state.offset.y;
+                    }
+                },
+            );
+        })
+        .textures_delta
+        .clear();
+        assert!(!output.actions.iter().any(|action| matches!(action, Action::MoveFloating { .. })));
+        for action in output.actions {
+            layout.apply(action).unwrap();
+        }
+        (body, offset)
+    };
+    for _ in 0..3 {
+        render(vec![]);
+    }
+    let (body, _) = render(vec![]);
+    let start = pos2(body.center().x, body.top() + 6.0);
+    render(vec![Event::PointerMoved(start), pointer_button(start, true)]);
+    let (_, scrolled) = render(vec![Event::PointerMoved(start + vec2(0.0, 40.0))]);
+    assert!(scrolled > 0.0, "the scrollbar must actually scroll");
+    render(vec![pointer_button(start + vec2(0.0, 40.0), false)]);
+    assert_eq!(layout.floating[0].rect, original);
 }

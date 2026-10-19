@@ -251,6 +251,7 @@ fn floating_brushes_merge_detach_and_redock_through_real_pointer_input() {
     }
 }
 
+/// Exercise every border while preserving content across themes, sizes and pixel scales.
 #[test]
 fn floating_borders_resize_content_at_multiple_themes_sizes_and_scales() {
     let output = std::env::var_os("CRAFT_UI_DOCK_VISUAL_DIR").map(PathBuf::from);

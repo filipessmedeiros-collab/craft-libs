@@ -346,10 +346,12 @@ struct Renderer<'a, P> {
 }
 
 impl<P: Clone + Eq + Hash + Debug + Send + Sync + 'static> Renderer<'_, P> {
+    /// Retain renderer-owned controls so workspace replacement can stop their drags.
     fn register_interaction(&mut self, ctx: &Context, id: Id) {
-        // A validated tree has at most 2*MAX_PANELS nodes. Tabs, stack dividers,
-        // floating grips/corners and splits fit comfortably inside this fixed bound.
-        const CAP: usize = 8 * super::MAX_PANELS;
+        // At most 12 controls per panel cover tabs, splits, stack dividers, a move
+        // grip and eight floating resize handles. Allow both previous and current
+        // frame identities during rendering, including a complete workspace change.
+        const CAP: usize = 32 * super::MAX_PANELS;
         if self.owned_interactions.len() < CAP && !self.owned_interactions.contains(&id) {
             self.owned_interactions.push(id);
         }
@@ -544,12 +546,19 @@ impl<P: Clone + Eq + Hash + Debug + Send + Sync + 'static> Renderer<'_, P> {
         }
     }
 
+    /// Render tabs and body inside the reserved border while moving the outer frame.
     fn group(&mut self, ui: &mut Ui, panels: &[P], active: usize, rect: Rect, floating: bool) {
         let Some(selected) = panels.get(active) else { return };
         let policy = (self.permissions)(selected);
+        // Reserve the complete corner depth, not just the thinner edge bands, so
+        // no resize region overlaps tabs, group controls or body scrollbars.
+        let inner = if floating { float_content_rect(rect) } else { rect };
+        if floating {
+            ui.painter().rect_filled(rect, 0.0, self.style.background);
+        }
         let bare = panels.len() == 1 && policy == Permissions::PROTECTED;
         if bare {
-            self.contents(ui, selected, rect);
+            self.contents(ui, selected, inner);
             self.targets.push(DropTarget {
                 anchor: selected.clone(),
                 rect,
@@ -560,7 +569,7 @@ impl<P: Clone + Eq + Hash + Debug + Send + Sync + 'static> Renderer<'_, P> {
             });
             return;
         }
-        let mut strip = Rect::from_min_max(rect.min, pos2(rect.right(), (rect.top() + self.style.tab_height).min(rect.bottom())));
+        let mut strip = Rect::from_min_max(inner.min, pos2(inner.right(), (inner.top() + self.style.tab_height).min(inner.bottom())));
         ui.painter().rect_filled(strip, 0.0, self.style.tab_background);
         if floating {
             let grip = Rect::from_min_max(strip.min, pos2((strip.left() + 12.0).min(strip.right()), strip.bottom()));
@@ -655,7 +664,7 @@ impl<P: Clone + Eq + Hash + Debug + Send + Sync + 'static> Renderer<'_, P> {
             allow_splits: !floating,
             accepts_tabs: policy.accepts_tabs,
         });
-        self.contents(ui, selected, Rect::from_min_max(pos2(rect.left(), strip.bottom()), rect.max));
+        self.contents(ui, selected, Rect::from_min_max(pos2(inner.left(), strip.bottom()), inner.max));
         ui.painter().rect_stroke(rect, 0.0, self.style.border, StrokeKind::Inside);
     }
 
@@ -735,6 +744,7 @@ impl<P: Clone + Eq + Hash + Debug + Send + Sync + 'static> Renderer<'_, P> {
         });
     }
 
+    /// Render floating groups and register their move and resize interactions.
     fn floating(&mut self, ctx: &Context) {
         let screen = ctx.content_rect();
         if !super::targets::usable(screen) {
@@ -925,10 +935,20 @@ fn split_bounds(available: f32, axis: SplitAxis, first: PanelLimits, second: Pan
     if constrained_lo <= constrained_hi { (constrained_lo, constrained_hi) } else { (lo, hi) }
 }
 
-/// Non-overlapping, inside-the-frame hit regions leave panel controls and adjacent windows alone.
+/// Space reserved for floating resize corners; shared with content layout.
+fn float_border(rect: Rect) -> f32 {
+    10.0_f32.min(rect.width() / 2.0).min(rect.height() / 2.0)
+}
+
+/// Keep application chrome and body widgets strictly inside the resize border.
+fn float_content_rect(rect: Rect) -> Rect {
+    rect.shrink(float_border(rect))
+}
+
+/// Non-overlapping hit regions occupy only the reserved border, inside the window.
 fn float_resize_handles(rect: Rect) -> [(i8, i8, Rect, egui::CursorIcon); 8] {
     use egui::CursorIcon::{ResizeHorizontal, ResizeNeSw, ResizeNwSe, ResizeVertical};
-    let corner = 10.0_f32.min(rect.width() / 2.0).min(rect.height() / 2.0);
+    let corner = float_border(rect);
     let edge = 5.0_f32.min(corner);
     let (l, r, t, b) = (rect.left(), rect.right(), rect.top(), rect.bottom());
     [
@@ -943,6 +963,7 @@ fn float_resize_handles(rect: Rect) -> [(i8, i8, Rect, egui::CursorIcon); 8] {
     ]
 }
 
+/// Move selected edges within panel and screen limits while preserving opposite edges.
 fn resize_float(rect: Rect, hx: i8, hy: i8, delta: Vec2, limits: PanelLimits, screen: Rect, tab_height: f32) -> Rect {
     let min = limits.min.max(vec2(40.0, tab_height + 20.0)).min(limits.max).min(screen.size());
     let mut result = rect;
@@ -974,6 +995,57 @@ fn resize_float(rect: Rect, hx: i8, hy: i8, delta: Vec2, limits: PanelLimits, sc
 mod float_resize_tests {
     use super::*;
 
+    /// Body scrollbars and all tab/header controls share the reserved inner rectangle.
+    #[test]
+    fn resize_regions_do_not_overlap_content_or_chrome() {
+        for size in [vec2(300.0, 220.0), vec2(40.0, 46.0), vec2(800.0, 600.0)] {
+            let frame = Rect::from_min_size(pos2(80.0, 70.0), size);
+            let content = float_content_rect(frame);
+            assert!(content.is_positive());
+            for (_, _, hit, _) in float_resize_handles(frame) {
+                let overlap = content.intersect(hit);
+                assert!(overlap.width() <= 0.0 || overlap.height() <= 0.0);
+            }
+        }
+    }
+
+    /// A late handle beyond the old capacity must remain cancellable in both ID lists.
+    #[test]
+    fn late_floating_handle_is_registered_and_cancelled() {
+        let ctx = Context::default();
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            let area = Id::new("capacity-test");
+            let handle = area.with("last-floating-handle");
+            let previous: Vec<_> = (0..8 * super::super::MAX_PANELS).map(|n| area.with(n)).collect();
+            ctx.data_mut(|d| d.insert_temp(area.with("owned-interactions"), previous.clone()));
+            let style = DockStyle::from_ui(ui);
+            let layout = Layout::<u32>::default();
+            let mut content = BodyContent(|_: &mut Ui, _: &u32| {});
+            let mut renderer = Renderer {
+                id: area,
+                style: &style,
+                label: &|_: &u32| String::new(),
+                permissions: &|_: &u32| Permissions::default(),
+                limits: &|_: &u32| PanelLimits::default(),
+                content: &mut content,
+                activation: None,
+                blockers: Vec::new(),
+                layout: &layout,
+                targets: Vec::new(),
+                owned_interactions: previous,
+                output: DockOutput::default(),
+            };
+            renderer.register_interaction(&ctx, handle);
+            assert!(renderer.owned_interactions.contains(&handle));
+            ctx.set_dragged_id(handle);
+            cancel_drag::<u32>(&ctx, area);
+            assert_eq!(ctx.dragged_id(), None);
+        })
+        .textures_delta
+        .clear();
+    }
+
+    /// Exercise growth and shrink limits without moving the anchored edges.
     #[test]
     fn moving_edges_respect_limits_and_screen_without_shifting_the_anchor() {
         let rect = Rect::from_min_size(pos2(100.0, 100.0), vec2(300.0, 200.0));
