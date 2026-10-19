@@ -763,42 +763,51 @@ impl<P: Clone + Eq + Hash + Debug + Send + Sync + 'static> Renderer<'_, P> {
                 let rect = Rect::from_min_size(ui.min_rect().min, rect.size());
                 ui.allocate_rect(rect, Sense::hover());
                 self.group(ui, &group.panels, group.active, rect, true);
-                let corner = Rect::from_min_max((rect.max - vec2(12.0, 12.0)).max(rect.min), rect.max);
-                let response = ui.interact(corner, id.with("resize"), Sense::drag()).on_hover_cursor(egui::CursorIcon::ResizeNwSe);
-                self.register_interaction(ui.ctx(), response.id);
-                response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), &self.style.resize_window_label));
-                if response.drag_started() {
-                    response.request_focus();
-                }
-                let mut delta = if response.dragged() { ui.input(|i| i.pointer.delta()) } else { Vec2::ZERO };
-                if response.has_focus() {
-                    ui.memory_mut(|memory| {
-                        memory.set_focus_lock_filter(
-                            response.id,
-                            egui::EventFilter { horizontal_arrows: true, vertical_arrows: true, ..Default::default() },
-                        )
-                    });
-                    ui.input_mut(|input| {
-                        if input.consume_key(egui::Modifiers::NONE, Key::ArrowLeft) {
-                            delta.x -= 8.0;
-                        }
-                        if input.consume_key(egui::Modifiers::NONE, Key::ArrowRight) {
-                            delta.x += 8.0;
-                        }
-                        if input.consume_key(egui::Modifiers::NONE, Key::ArrowUp) {
-                            delta.y -= 8.0;
-                        }
-                        if input.consume_key(egui::Modifiers::NONE, Key::ArrowDown) {
-                            delta.y += 8.0;
-                        }
-                    });
-                }
-                if response.enabled() && delta != Vec2::ZERO {
-                    let size = (rect.size() + delta).max(limits.min.max(vec2(40.0, self.style.tab_height + 20.0))).min(limits.max).min(screen.size());
-                    self.output.actions.push(Action::MoveFloating { panel: first.clone(), rect: [rect.left(), rect.top(), size.x, size.y] });
-                }
-                if response.hovered() || response.dragged() || response.has_focus() {
-                    ui.painter().line_segment([corner.left_bottom(), corner.right_top()], Stroke::new(2.0, self.style.accent));
+                for (hx, hy, hit, cursor) in float_resize_handles(rect) {
+                    // Keep the original lower-right grip ID for keyboard focus and automation.
+                    let handle_id = if (hx, hy) == (1, 1) { id.with("resize") } else { id.with(("resize", hx, hy)) };
+                    let response = ui.interact(hit, handle_id, Sense::drag()).on_hover_and_drag_cursor(cursor);
+                    self.register_interaction(ui.ctx(), response.id);
+                    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), &self.style.resize_window_label));
+                    if response.drag_started() {
+                        response.request_focus();
+                    }
+                    // A press can arrive with a hover move from a different handle in the same
+                    // frame. Only motion after the press belongs to this resize gesture.
+                    let mut delta =
+                        if response.dragged() && !ui.input(|i| i.pointer.primary_pressed()) { ui.input(|i| i.pointer.delta()) } else { Vec2::ZERO };
+                    if response.has_focus() {
+                        ui.memory_mut(|memory| {
+                            memory.set_focus_lock_filter(
+                                response.id,
+                                egui::EventFilter { horizontal_arrows: true, vertical_arrows: true, ..Default::default() },
+                            )
+                        });
+                        ui.input_mut(|input| {
+                            if input.consume_key(egui::Modifiers::NONE, Key::ArrowLeft) {
+                                delta.x -= 8.0;
+                            }
+                            if input.consume_key(egui::Modifiers::NONE, Key::ArrowRight) {
+                                delta.x += 8.0;
+                            }
+                            if input.consume_key(egui::Modifiers::NONE, Key::ArrowUp) {
+                                delta.y -= 8.0;
+                            }
+                            if input.consume_key(egui::Modifiers::NONE, Key::ArrowDown) {
+                                delta.y += 8.0;
+                            }
+                        });
+                    }
+                    if response.enabled() && delta != Vec2::ZERO {
+                        let resized = resize_float(rect, hx, hy, delta, limits, screen, self.style.tab_height);
+                        self.output.actions.push(Action::MoveFloating {
+                            panel: first.clone(),
+                            rect: [resized.left(), resized.top(), resized.width(), resized.height()],
+                        });
+                    }
+                    if (hx, hy) == (1, 1) && (response.hovered() || response.dragged() || response.has_focus()) {
+                        ui.painter().line_segment([hit.left_bottom(), hit.right_top()], Stroke::new(2.0, self.style.accent));
+                    }
                 }
             });
         }
@@ -914,4 +923,73 @@ fn split_bounds(available: f32, axis: SplitAxis, first: PanelLimits, second: Pan
     let constrained_lo = lo.max(available - b_max);
     let constrained_hi = hi.min(a_max);
     if constrained_lo <= constrained_hi { (constrained_lo, constrained_hi) } else { (lo, hi) }
+}
+
+/// Non-overlapping, inside-the-frame hit regions leave panel controls and adjacent windows alone.
+fn float_resize_handles(rect: Rect) -> [(i8, i8, Rect, egui::CursorIcon); 8] {
+    use egui::CursorIcon::{ResizeHorizontal, ResizeNeSw, ResizeNwSe, ResizeVertical};
+    let corner = 10.0_f32.min(rect.width() / 2.0).min(rect.height() / 2.0);
+    let edge = 5.0_f32.min(corner);
+    let (l, r, t, b) = (rect.left(), rect.right(), rect.top(), rect.bottom());
+    [
+        (-1, -1, Rect::from_min_max(pos2(l, t), pos2(l + corner, t + corner)), ResizeNwSe),
+        (1, -1, Rect::from_min_max(pos2(r - corner, t), pos2(r, t + corner)), ResizeNeSw),
+        (-1, 1, Rect::from_min_max(pos2(l, b - corner), pos2(l + corner, b)), ResizeNeSw),
+        (1, 1, Rect::from_min_max(pos2(r - corner, b - corner), pos2(r, b)), ResizeNwSe),
+        (-1, 0, Rect::from_min_max(pos2(l, t + corner), pos2(l + edge, b - corner)), ResizeHorizontal),
+        (1, 0, Rect::from_min_max(pos2(r - edge, t + corner), pos2(r, b - corner)), ResizeHorizontal),
+        (0, -1, Rect::from_min_max(pos2(l + corner, t), pos2(r - corner, t + edge)), ResizeVertical),
+        (0, 1, Rect::from_min_max(pos2(l + corner, b - edge), pos2(r - corner, b)), ResizeVertical),
+    ]
+}
+
+fn resize_float(rect: Rect, hx: i8, hy: i8, delta: Vec2, limits: PanelLimits, screen: Rect, tab_height: f32) -> Rect {
+    let min = limits.min.max(vec2(40.0, tab_height + 20.0)).min(limits.max).min(screen.size());
+    let mut result = rect;
+    // Clamp each moving edge while anchoring the opposite edge, including at the screen bounds.
+    if hx != 0 {
+        let available = if hx < 0 { rect.right() - screen.left() } else { screen.right() - rect.left() };
+        let max = limits.max.x.min(available);
+        let width = (rect.width() + f32::from(hx) * delta.x).clamp(min.x.min(max), max);
+        if hx < 0 {
+            result.min.x = rect.right() - width;
+        } else {
+            result.max.x = rect.left() + width;
+        }
+    }
+    if hy != 0 {
+        let available = if hy < 0 { rect.bottom() - screen.top() } else { screen.bottom() - rect.top() };
+        let max = limits.max.y.min(available);
+        let height = (rect.height() + f32::from(hy) * delta.y).clamp(min.y.min(max), max);
+        if hy < 0 {
+            result.min.y = rect.bottom() - height;
+        } else {
+            result.max.y = rect.top() + height;
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+mod float_resize_tests {
+    use super::*;
+
+    #[test]
+    fn moving_edges_respect_limits_and_screen_without_shifting_the_anchor() {
+        let rect = Rect::from_min_size(pos2(100.0, 100.0), vec2(300.0, 200.0));
+        let screen = Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0));
+        let limits = PanelLimits { min: vec2(100.0, 80.0), max: vec2(450.0, 350.0) };
+        for (hx, hy) in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1)] {
+            let grown = resize_float(rect, hx, hy, vec2(f32::from(hx) * 1000.0, f32::from(hy) * 1000.0), limits, screen, 26.0);
+            assert!(screen.contains_rect(grown));
+            assert!(grown.width() <= limits.max.x && grown.height() <= limits.max.y);
+            let shrunk = resize_float(rect, hx, hy, vec2(f32::from(hx) * -1000.0, f32::from(hy) * -1000.0), limits, screen, 26.0);
+            assert_eq!(shrunk.width(), if hx == 0 { rect.width() } else { limits.min.x });
+            assert_eq!(shrunk.height(), if hy == 0 { rect.height() } else { limits.min.y });
+            for result in [grown, shrunk] {
+                assert_eq!(if hx < 0 { result.right() } else { result.left() }, if hx < 0 { rect.right() } else { rect.left() });
+                assert_eq!(if hy < 0 { result.bottom() } else { result.top() }, if hy < 0 { rect.bottom() } else { rect.top() });
+            }
+        }
+    }
 }

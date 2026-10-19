@@ -300,10 +300,15 @@ fn old_hidden_locations_accept_panel_ids_without_a_default_identity() {
 }
 
 fn frame(ctx: &Context, layout: &Layout<u32>, events: Vec<Event>, focused: bool) -> (DockOutput<u32>, Vec<Id>) {
+    let (output, ids, _) = frame_with_cursor(ctx, layout, events, focused);
+    (output, ids)
+}
+
+fn frame_with_cursor(ctx: &Context, layout: &Layout<u32>, events: Vec<Event>, focused: bool) -> (DockOutput<u32>, Vec<Id>, egui::CursorIcon) {
     let mut output = DockOutput::default();
     let mut ids = Vec::new();
     let input = RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))), events, focused, ..Default::default() };
-    ctx.run_ui(input, |ui| {
+    let mut full_output = ctx.run_ui(input, |ui| {
         let style = DockStyle::from_ui(ui);
         output = DockArea::new(Id::new("test-area")).show(
             ui,
@@ -316,10 +321,9 @@ fn frame(ctx: &Context, layout: &Layout<u32>, events: Vec<Event>, focused: bool)
                 ui.label("Actual panel content");
             },
         );
-    })
-    .textures_delta
-    .clear();
-    (output, ids)
+    });
+    full_output.textures_delta.clear();
+    (output, ids, full_output.platform_output.cursor_icon)
 }
 
 #[test]
@@ -1088,5 +1092,64 @@ fn popup_action_labels_use_custom_visual_text_and_logical_accessibility() {
             0,
             "visual substitution must not replace logical accessibility"
         );
+    }
+}
+
+#[test]
+fn floating_windows_resize_from_every_edge_and_corner_without_moving_the_opposite_edge() {
+    use egui::CursorIcon::{ResizeHorizontal, ResizeNeSw, ResizeNwSe, ResizeVertical};
+    for (hx, hy, cursor) in [
+        (-1_i8, 0_i8, ResizeHorizontal),
+        (1, 0, ResizeHorizontal),
+        (0, -1, ResizeVertical),
+        (0, 1, ResizeVertical),
+        (-1, -1, ResizeNwSe),
+        (1, -1, ResizeNeSw),
+        (-1, 1, ResizeNeSw),
+        (1, 1, ResizeNwSe),
+    ] {
+        let ctx = Context::default();
+        let mut layout = sample();
+        for _ in 0..3 {
+            step(&ctx, &mut layout, Vec::new());
+        }
+        let [x, y, w, h] = layout.floating[0].rect;
+        let start = pos2(
+            x + if hx < 0 {
+                2.0
+            } else if hx > 0 {
+                w - 2.0
+            } else {
+                w / 2.0
+            },
+            y + if hy < 0 {
+                2.0
+            } else if hy > 0 {
+                h - 2.0
+            } else {
+                h / 2.0
+            },
+        );
+        let (_, _, actual_cursor) = frame_with_cursor(&ctx, &layout, vec![Event::PointerMoved(start)], true);
+        assert_eq!(actual_cursor, cursor, "hover at ({hx}, {hy})");
+        step(&ctx, &mut layout, vec![pointer_button(start, true)]);
+        let delta = vec2(f32::from(hx) * 24.0, f32::from(hy) * 24.0);
+        let end = start + delta;
+        let (out, _, actual_cursor) = frame_with_cursor(&ctx, &layout, vec![Event::PointerMoved(end)], true);
+        let actions = out.actions;
+        for action in &actions {
+            layout.apply(action.clone()).unwrap();
+        }
+        assert!(actions.iter().any(|a| matches!(a, Action::MoveFloating { panel: 5, .. })), "({hx}, {hy}): {actions:?}");
+        assert_eq!(actual_cursor, cursor, "drag at ({hx}, {hy})");
+        step(&ctx, &mut layout, vec![pointer_button(end, false)]);
+        let expected = [
+            x + if hx < 0 { -24.0 } else { 0.0 },
+            y + if hy < 0 { -24.0 } else { 0.0 },
+            w + if hx != 0 { 24.0 } else { 0.0 },
+            h + if hy != 0 { 24.0 } else { 0.0 },
+        ];
+        assert_eq!(layout.floating[0].rect, expected, "({hx}, {hy})");
+        assert_eq!(layout.panels().len(), 6, "resizing must keep group membership");
     }
 }
